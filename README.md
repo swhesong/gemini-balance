@@ -118,7 +118,7 @@ app/
 
 1.  **克隆仓库并安装依赖**:
     ```bash
-    git clone https://github.com/sofs2005/gemini-balance.git
+    git clone https://github.com/swhesong/gemini-balance
     cd gemini-balance
     pip install -r requirements.txt
     ```
