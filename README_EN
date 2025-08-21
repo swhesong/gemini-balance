@@ -118,7 +118,7 @@ This is the most recommended deployment method, which can start the application 
 
 1.  **Clone the repository and install dependencies**:
     ```bash
-    git clone https://github.com/sofs2005/gemini-balance.git
+    git clone https://github.com/swhesong/gemini-balance
     cd gemini-balance
     pip install -r requirements.txt
     ```
