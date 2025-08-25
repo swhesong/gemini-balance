@@ -7,7 +7,6 @@ from abc import ABC, abstractmethod
 from app.config.config import settings
 from app.log.logger import get_api_client_logger
 from app.core.constants import DEFAULT_TIMEOUT
-from app.utils.helpers import simplify_api_error_message
 
 logger = get_api_client_logger()
 
@@ -19,8 +18,9 @@ def initialize_api_client():
     global _api_client
     if _api_client is None:
         timeout = httpx.Timeout(DEFAULT_TIMEOUT, read=DEFAULT_TIMEOUT)
+        # 移除默认headers，确保客户端是干净的
         _api_client = httpx.AsyncClient(timeout=timeout)
-        logger.info("Global httpx.AsyncClient initialized.")
+        logger.info("Global httpx.AsyncClient initialized without default headers.")
 
 async def close_api_client():
     """关闭全局 API 客户端"""
@@ -98,7 +98,7 @@ class GeminiApiClient(ApiClient):
             return response.json()
         except httpx.HTTPStatusError as e:
             logger.error(f"获取模型列表失败: {e.response.status_code}")
-            logger.error(simplify_api_error_message(e.response.text))
+            logger.error(e.response.text)
             return None
         except httpx.RequestError as e:
             logger.error(f"请求模型列表失败: {e}")
@@ -135,10 +135,13 @@ class GeminiApiClient(ApiClient):
                     try:
                         error_json = response.json()
                         error_message = error_json.get("error", {}).get("message", "Quota exceeded")
+                        logger.error(f"API call failed - Status: 429 (Quota exceeded), Message: {error_message}")
                         raise Exception(f"API call failed with status code 429, {error_message}")
                     except (ValueError, KeyError):
+                        logger.error(f"API call failed - Status: 429 (Quota exceeded), Raw response: {error_content[:200]}...")
                         raise Exception(f"API call failed with status code 429, Quota exceeded")
                 else:
+                    logger.error(f"API call failed - Status: {response.status_code}, Content: {error_content}")
                     raise Exception(f"API call failed with status code {response.status_code}, {error_content}")
             
             response_data = response.json()
@@ -185,7 +188,7 @@ class GeminiApiClient(ApiClient):
 
             if response.status_code != 200:
                 error_content = response.text
-                logger.error(f"Embedding API call failed - Status: {response.status_code}, Content: {simplify_api_error_message(error_content)}")
+                logger.error(f"Embedding API call failed - Status: {response.status_code}, Content: {error_content}")
                 raise Exception(f"API call failed with status code {response.status_code}, {error_content}")
 
             return response.json()
@@ -225,7 +228,7 @@ class GeminiApiClient(ApiClient):
 
             if response.status_code != 200:
                 error_content = response.text
-                logger.error(f"Batch embedding API call failed - Status: {response.status_code}, Content: {simplify_api_error_message(error_content)}")
+                logger.error(f"Batch embedding API call failed - Status: {response.status_code}, Content: {error_content}")
                 raise Exception(f"API call failed with status code {response.status_code}, {error_content}")
 
             return response.json()
@@ -262,7 +265,21 @@ class GeminiApiClient(ApiClient):
                     if response.status_code != 200:
                         error_content = await response.aread()
                         error_msg = error_content.decode("utf-8")
-                        raise Exception(f"API call failed with status code {response.status_code}, {error_msg}")
+
+                        # 对429错误进行简化处理
+                        if response.status_code == 429:
+                            try:
+                                import json
+                                error_json = json.loads(error_msg)
+                                error_message = error_json.get("error", {}).get("message", "Quota exceeded")
+                                logger.error(f"Stream API call failed - Status: 429 (Quota exceeded), Message: {error_message}")
+                                raise Exception(f"API call failed with status code 429, {error_message}")
+                            except (ValueError, KeyError):
+                                logger.error(f"Stream API call failed - Status: 429 (Quota exceeded), Raw response: {error_msg[:200]}...")
+                                raise Exception(f"API call failed with status code 429, Quota exceeded")
+                        else:
+                            logger.error(f"Stream API call failed - Status: {response.status_code}, Content: {error_msg}")
+                            raise Exception(f"API call failed with status code {response.status_code}, {error_msg}")
                     async for line in response.aiter_lines():
                         yield line
         else:
@@ -270,7 +287,21 @@ class GeminiApiClient(ApiClient):
                 if response.status_code != 200:
                     error_content = await response.aread()
                     error_msg = error_content.decode("utf-8")
-                    raise Exception(f"API call failed with status code {response.status_code}, {error_msg}")
+
+                    # 对429错误进行简化处理
+                    if response.status_code == 429:
+                        try:
+                            import json
+                            error_json = json.loads(error_msg)
+                            error_message = error_json.get("error", {}).get("message", "Quota exceeded")
+                            logger.error(f"Stream API call failed - Status: 429 (Quota exceeded), Message: {error_message}")
+                            raise Exception(f"API call failed with status code 429, {error_message}")
+                        except (ValueError, KeyError):
+                            logger.error(f"Stream API call failed - Status: 429 (Quota exceeded), Raw response: {error_msg[:200]}...")
+                            raise Exception(f"API call failed with status code 429, Quota exceeded")
+                    else:
+                        logger.error(f"Stream API call failed - Status: {response.status_code}, Content: {error_msg}")
+                        raise Exception(f"API call failed with status code {response.status_code}, {error_msg}")
                 async for line in response.aiter_lines():
                     yield line
 
@@ -308,7 +339,7 @@ class GeminiApiClient(ApiClient):
                         logger.error(f"Count tokens API call failed - Status: 429 (Quota exceeded), Raw response: {error_content[:200]}...")
                         raise Exception(f"API call failed with status code 429, Quota exceeded")
                 else:
-                    logger.error(f"Count tokens API call failed - Status: {response.status_code}, Content: {simplify_api_error_message(error_content)}")
+                    logger.error(f"Count tokens API call failed - Status: {response.status_code}, Content: {error_content}")
                     raise Exception(f"API call failed with status code {response.status_code}, {error_content}")
             return response.json()
         except httpx.RequestError as e:

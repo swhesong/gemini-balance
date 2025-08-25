@@ -304,7 +304,8 @@ endblock %} {% block head_extra_styles %}
   }
 
   #validKeys li,
-  #invalidKeys li {
+  #invalidKeys li,
+  #attentionKeysList li {
     background-color: rgba(255, 255, 255, 0.9);
     border: 1px solid rgba(0, 0, 0, 0.08);
     transition: all 0.3s ease;
@@ -314,7 +315,8 @@ endblock %} {% block head_extra_styles %}
   }
 
   #validKeys li:hover,
-  #invalidKeys li:hover {
+  #invalidKeys li:hover,
+  #attentionKeysList li:hover {
     border-color: rgba(0, 0, 0, 0.12);
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
     transform: translateY(-2px);
@@ -322,19 +324,18 @@ endblock %} {% block head_extra_styles %}
   }
 
   #validKeys li.selected,
-  #invalidKeys li.selected {
+  #invalidKeys li.selected,
+  #attentionKeysList li.selected {
     background-color: rgba(239, 246, 255, 0.95);
     border-color: rgba(59, 130, 246, 0.3);
   }
 
-  /* 隐藏所有列表中的原生复选框 */
-  #validKeys .key-checkbox,
-  #invalidKeys .key-checkbox,
-  #attentionKeysList .key-checkbox {
+  /* 隐藏原生复选框 */
+  .key-checkbox {
     display: none;
   }
 
-  /* 为所有列表应用自定义复选框样式 */
+  /* 自定义复选框样式 */
   #validKeys li::before,
   #invalidKeys li::before,
   #attentionKeysList li::before {
@@ -358,7 +359,7 @@ endblock %} {% block head_extra_styles %}
     border-color: #2563eb; /* blue-600 */
   }
 
-  /* 为所有列表应用自定义复选框对勾样式 */
+  /* 自定义复选框对勾样式 */
   #validKeys li.selected::after,
   #invalidKeys li.selected::after,
   #attentionKeysList li.selected::after {
@@ -371,30 +372,6 @@ endblock %} {% block head_extra_styles %}
     transform: translateY(-50%) scale(0.9);
     color: white;
     font-size: 0.8rem;
-  }
-
-  /* 值得注意的Key列表样式与选中态 */
-  #attentionKeysList li {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    background-color: rgba(255, 255, 255, 0.9);
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 0.5rem;
-    padding: 0.5rem 0.75rem;
-    transition: all 0.2s ease;
-    cursor: pointer;
-    position: relative;
-    padding-left: 2.5rem; /* 为自定义复选框留出空间 */
-  }
-  #attentionKeysList li:hover {
-    border-color: rgba(0, 0, 0, 0.12);
-    box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-    background-color: rgba(249, 250, 251, 0.95);
-  }
-  #attentionKeysList li.selected {
-    background-color: rgba(239, 246, 255, 0.95); /* light blue */
-    border-color: rgba(59, 130, 246, 0.35);
   }
 
   .key-text {
@@ -1397,59 +1374,35 @@ endblock %} {% block head_extra_styles %}
               <input id="attentionErrCustom" type="number" min="100" max="599" placeholder="自定义" class="form-input h-7 w-20 px-2 py-1 text-xs border rounded focus:ring-primary-500 focus:border-primary-500" />
               <button id="attentionErrGo" class="px-2 py-1 rounded bg-blue-500 hover:bg-blue-600 text-white" title="查询">查询</button>
             </div>
-            <div class="flex items-center gap-2 ml-3">
+            <div class="flex items-center gap-1 ml-3">
               <label for="attentionLimitInput" class="text-xs text-gray-600">数量</label>
               <input id="attentionLimitInput" type="number" min="1" max="1000" value="10" class="form-input h-7 w-20 px-2 py-1 text-xs border rounded focus:ring-primary-500 focus:border-primary-500" />
-              <!-- 全选移动到数量输入框右侧 -->
-              <div class="flex items-center gap-1">
-                <input
-                  type="checkbox"
-                  id="selectAllAttention"
-                  class="form-checkbox h-4 w-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500"
-                  onchange="toggleSelectAll('attention', this.checked)"
-                />
-                <label for="selectAllAttention" class="text-xs select-none whitespace-nowrap font-semibold" style="color: #1f2937 !important;">全选</label>
-              </div>
             </div>
+           <div class="flex items-center gap-1 ml-auto" onclick="event.stopPropagation();">
+               <input type="checkbox" id="selectAllAttention" class="form-checkbox h-4 w-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500" onchange="toggleSelectAll('attention', this.checked)">
+               <label for="selectAllAttention" class="text-sm select-none whitespace-nowrap font-semibold" style="color: #1f2937 !important;">全选</label>
+           </div>
           </div>
         </div>
-      <div class="p-4">
-        <!-- 批量操作按钮组 (仅在选中时显示) -->
-        <div
-          id="attentionBatchActions"
-          class="p-3 border mb-3 hidden flex items-center flex-wrap gap-3"
-          style="background-color: rgba(249, 250, 251, 0.95); border-color: rgba(0, 0, 0, 0.08);"
-        >
-          <span class="text-sm font-semibold whitespace-nowrap" style="color: #1f2937 !important;">
-            已选择 <span id="attentionSelectedCount">0</span> 项
-          </span>
-          <button
-            class="flex items-center gap-1 bg-success-600 hover:bg-success-700 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed"
-            onclick="event.stopPropagation(); showVerifyModal('attention', event)"
-            disabled
-          >
-            <i class="fas fa-check-double"></i> 批量验证
-          </button>
-          <button
-            class="flex items-center gap-1 bg-blue-500 hover:bg-blue-600 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed"
-            onclick="event.stopPropagation(); copySelectedKeys('attention')"
-            disabled
-          >
-            <i class="fas fa-copy"></i> 批量复制
-          </button>
-          <button
-            class="flex items-center gap-1 bg-red-800 hover:bg-red-900 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed"
-            onclick="event.stopPropagation(); showDeleteConfirmationModal('attention', event)"
-            disabled
-          >
-            <i class="fas fa-trash-alt"></i> 批量删除
-          </button>
+     <!-- 批量操作按钮组 (仅在选中时显示) -->
+     <div id="attentionBatchActions" class="p-3 border-t hidden flex items-center flex-wrap gap-3" style="background-color: rgba(249, 250, 251, 0.95); border-color: rgba(0, 0, 0, 0.08);">
+       <span class="text-sm font-semibold whitespace-nowrap" style="color: #1f2937 !important;">已选择 <span id="attentionSelectedCount">0</span> 项</span>
+       <button class="flex items-center gap-1 bg-success-600 hover:bg-success-700 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed" onclick="event.stopPropagation(); showVerifyModal('attention', event)" disabled>
+         <i class="fas fa-check-double"></i> 批量验证
+       </button>
+       <button class="flex items-center gap-1 bg-blue-500 hover:bg-blue-600 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed" onclick="event.stopPropagation(); copySelectedKeys('attention')" disabled>
+         <i class="fas fa-copy"></i> 批量复制
+       </button>
+       <button class="flex items-center gap-1 bg-red-800 hover:bg-red-900 text-white px-2.5 py-1 rounded-lg text-xs font-medium transition-all duration-200 disabled:cursor-not-allowed" onclick="event.stopPropagation(); showDeleteConfirmationModal('attention', event)" disabled>
+         <i class="fas fa-trash-alt"></i> 批量删除
+       </button>
+     </div>
+        <div class="p-4">
+          <ul id="attentionKeysList" class="space-y-2">
+            <li class="text-center text-gray-500 py-2">加载中...</li>
+          </ul>
         </div>
-        <ul id="attentionKeysList" class="space-y-2">
-          <li class="text-center text-gray-500 py-2">加载中...</li>
-        </ul>
       </div>
-    </div>
   </div>
 
     <!-- 有效密钥区域 -->

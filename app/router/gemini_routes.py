@@ -3,7 +3,6 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from copy import deepcopy
 import asyncio
 import re
-import datetime
 from app.config.config import settings
 from app.log.logger import get_gemini_logger
 from app.core.security import SecurityService
@@ -13,6 +12,7 @@ from app.service.embedding.gemini_embedding_service import GeminiEmbeddingServic
 from app.service.key.key_manager import KeyManager, get_key_manager_instance
 from app.service.tts.native.tts_routes import get_tts_chat_service
 from app.service.model.model_service import ModelService
+from app.handler.error_processor import handle_api_error_and_get_next_key, log_api_error
 from app.handler.retry_handler import RetryHandler
 from app.handler.error_handler import handle_route_errors
 from app.core.constants import API_VERSION
@@ -112,10 +112,12 @@ async def list_models(
 
 @router.post("/models/{model_name}:generateContent")
 @router_v1beta.post("/models/{model_name}:generateContent")
+@RetryHandler(key_arg="api_key")
 async def generate_content(
     model_name: str,
     request: GeminiRequest,
     _=Depends(security_service.verify_key_or_goog_api_key),
+    api_key: str = Depends(get_next_working_key_for_model),
     key_manager: KeyManager = Depends(get_key_manager),
     chat_service: GeminiChatService = Depends(get_chat_service)
 ):
@@ -139,7 +141,6 @@ async def generate_content(
                 logger.info(f"TTS responseModalities: {response_modalities}")
                 logger.info(f"TTS speechConfig: {speech_config}")
 
-        api_key = await key_manager.get_next_working_key(model_name=model_name)
         logger.info(f"Using API key: {redact_key_for_logging(api_key)}")
 
         if not await model_service.check_model_support(model_name):
@@ -170,10 +171,12 @@ async def generate_content(
 
 @router.post("/models/{model_name}:streamGenerateContent")
 @router_v1beta.post("/models/{model_name}:streamGenerateContent")
+@RetryHandler(key_arg="api_key")
 async def stream_generate_content(
     model_name: str,
     request: GeminiRequest,
     _=Depends(security_service.verify_key_or_goog_api_key),
+    api_key: str = Depends(get_next_working_key_for_model),
     key_manager: KeyManager = Depends(get_key_manager),
     chat_service: GeminiChatService = Depends(get_chat_service)
 ):
@@ -182,7 +185,6 @@ async def stream_generate_content(
     async with handle_route_errors(logger, operation_name, failure_message="Streaming request initiation failed"):
         logger.info(f"Handling Gemini streaming content generation for model: {model_name}")
         logger.debug(f"Request: \n{request.model_dump_json(indent=2)}")
-        api_key = await key_manager.get_next_working_key(model_name=model_name)
         logger.info(f"Using API key: {redact_key_for_logging(api_key)}")
 
         if not await model_service.check_model_support(model_name):
@@ -358,8 +360,17 @@ async def verify_key(api_key: str, chat_service: GeminiChatService = Depends(get
             return JSONResponse({"status": "valid"})
     except Exception as e:
         logger.error(f"Key verification failed: {str(e)}")
-        # The error is already handled by the chat_service, which uses the ErrorProcessor.
-        # The router's responsibility is just to return the final status.
+        # Use the centralized error handler to update key status, but ignore the returned new_key
+        await handle_api_error_and_get_next_key(
+            key_manager, e, api_key, settings.TEST_MODEL, retries=settings.MAX_RETRIES
+        )
+        # Also log the error to the database
+        await log_api_error(
+            api_key=api_key,
+            error=e,
+            model_name=settings.TEST_MODEL,
+            error_type="key-verification-single"
+        )
         return JSONResponse({"status": "invalid", "error": str(e)})
 
 
@@ -400,8 +411,17 @@ async def verify_selected_keys(
         except Exception as e:
             error_message = str(e)
             logger.warning(f"Key verification failed for {redact_key_for_logging(api_key)}: {error_message}")
-            # The error is already handled by the chat_service, which uses the ErrorProcessor.
-            # The router's responsibility is just to record the failure for this batch verification.
+            # Use the centralized error handler to update key status
+            await handle_api_error_and_get_next_key(
+                key_manager, e, api_key, settings.TEST_MODEL, retries=settings.MAX_RETRIES
+            )
+            # Also log the error to the database
+            await log_api_error(
+                api_key=api_key,
+                error=e,
+                model_name=settings.TEST_MODEL,
+                error_type="key-verification-batch"
+            )
             failed_keys[api_key] = error_message
             return api_key, "invalid", error_message
 
@@ -441,6 +461,66 @@ async def verify_selected_keys(
             "valid_count": valid_count,
             "invalid_count": 0
         })
+
+
+async def _stateless_verify_single_key(api_key: str, chat_service: GeminiChatService):
+    """一个独立的、无状态的密钥验证函数，不与KeyManager交互"""
+    try:
+        gemini_request = GeminiRequest(
+            contents=[GeminiContent(role="user", parts=[{"text": "hi"}])],
+            generation_config={"temperature": 0.7, "topP": 1.0, "maxOutputTokens": 10}
+        )
+        await chat_service.generate_content(
+            settings.TEST_MODEL,
+            gemini_request,
+            api_key
+        )
+        return {"key": api_key, "status": "valid", "error": None}
+    except Exception as e:
+        error_message = str(e)
+        logger.warning(f"Stateless verification failed for {redact_key_for_logging(api_key)}: {error_message}")
+        return {"key": api_key, "status": "invalid", "error": error_message}
+
+@router_v1beta.post("/batch-verify-stateless")
+async def batch_verify_stateless(
+    request: VerifySelectedKeysRequest,
+    chat_service: GeminiChatService = Depends(get_chat_service)
+):
+    """独立的、无状态的批量密钥验证，不影响系统密钥状态"""
+    logger.info("-" * 50 + "batch_verify_stateless" + "-" * 50)
+    keys_to_verify = request.keys
+    logger.info(f"Received stateless verification request for {len(keys_to_verify)} keys.")
+
+    if not keys_to_verify:
+        return JSONResponse({"error": "No keys provided"}, status_code=400)
+
+    CONCURRENT_LIMIT = 20  # 设置并发请求的上限
+    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
+    
+    async def controlled_verify(key):
+        async with semaphore:
+            return await _stateless_verify_single_key(key, chat_service)
+
+    tasks = [controlled_verify(key) for key in keys_to_verify]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    successful_keys = []
+    failed_keys = {}
+    for result in results:
+        if isinstance(result, Exception):
+            # This case should ideally not happen as _stateless_verify_single_key catches exceptions
+            logger.error(f"Unexpected error during stateless verification task: {result}")
+        elif result.get("status") == "valid":
+            successful_keys.append(result["key"])
+        else:
+            failed_keys[result["key"]] = result["error"]
+
+    return {
+        "successful_keys": successful_keys,
+        "failed_keys": failed_keys,
+        "valid_count": len(successful_keys),
+        "invalid_count": len(failed_keys)
+    }
 
 
 @router.post("/models/{model_name}:embedContent")

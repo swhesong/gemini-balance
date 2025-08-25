@@ -6,15 +6,14 @@ import asyncio
 import random
 from collections import deque
 from typing import Optional, Dict, Any
-from datetime import datetime, timezone
-import pytz
+from datetime import datetime
 import time
 
 from app.config.config import settings
 from app.log.logger import get_key_manager_logger
 from app.service.key.valid_key_models import ValidKeyWithTTL
 from app.domain.gemini_models import GeminiRequest, GeminiContent
-from app.handler.error_processor import ErrorProcessor
+from app.handler.error_processor import handle_api_error_and_get_next_key
 from app.utils.helpers import redact_key_for_logging
 
 logger = get_key_manager_logger()
@@ -31,7 +30,7 @@ class ValidKeyPool:
     - 统计监控和日志记录
     """
     
-    def __init__(self, pool_size: int, ttl_hours: int, key_manager, error_processor: ErrorProcessor):
+    def __init__(self, pool_size: int, ttl_hours: int, key_manager):
         """
         初始化有效密钥池
         
@@ -39,20 +38,16 @@ class ValidKeyPool:
             pool_size: 密钥池大小
             ttl_hours: 密钥TTL时间（小时）
             key_manager: 密钥管理器实例
-            error_processor: 错误处理器实例
         """
         self.pool_size = pool_size
         self.ttl_hours = ttl_hours
         self.key_manager = key_manager
-        self.error_processor = error_processor
         self.valid_keys: deque[ValidKeyWithTTL] = deque(maxlen=pool_size)
         self._pool_keys_set: set[str] = set()
-        self._verifying_keys: set[str] = set()
         concurrent_verifications = getattr(settings, 'CONCURRENT_VERIFICATIONS', 1)
         self.verification_semaphore = asyncio.Semaphore(concurrent_verifications)
         logger.info(f"Verification semaphore initialized with {concurrent_verifications} concurrent tasks.")
         self.emergency_lock = asyncio.Lock()     # 紧急补充锁
-        self.get_key_lock = asyncio.Lock()       # 获取密钥锁，防止并发竞态条件
         self.chat_service = None
         
         # 统计信息
@@ -69,8 +64,7 @@ class ValidKeyPool:
             "verification_failures": 0,
             "usage_exhausted_keys_removed": 0,  # 新增：因使用次数耗尽而移除的密钥数
             "pro_model_requests": 0,  # 新增：Pro模型请求数
-            "non_pro_model_requests": 0,  # 新增：非Pro模型请求数
-            "keys_checked_for_expiration": 0  # 新增：检查过期的密钥总数
+            "non_pro_model_requests": 0  # 新增：非Pro模型请求数
         }
 
         # 性能监控
@@ -134,12 +128,18 @@ class ValidKeyPool:
         else:
             return getattr(settings, 'NON_PRO_MODEL_MAX_USAGE', 20)
     
-    async def get_valid_key(self, model_name: str = None, increment_usage: bool = True) -> str:
+    async def get_valid_key(self, model_name: str = None) -> str:
         """
-        优化密钥获取逻辑，增加冷却状态检查和错误处理集成
+        获取有效密钥，同时触发异步补充
+
+        Args:
+            model_name: 模型名称（可选）
+
+        Returns:
+            str: 有效的API密钥
         """
         self.performance_stats["total_get_key_calls"] += 1
-        
+
         # 记录模型请求统计
         if model_name:
             if self._is_pro_model(model_name):
@@ -150,88 +150,67 @@ class ValidKeyPool:
         # 清理过期密钥
         expired_count = self._remove_expired_keys()
 
-        # 使用锁保护整个密钥获取过程
-        async with self.get_key_lock:
-            return await self._get_key_from_pool_with_checks(model_name, increment_usage)
-
-
-    async def _get_key_from_pool_with_checks(self, model_name: str = None, increment_usage: bool = True) -> str:
-        """
-        内部方法：从池中获取密钥并进行检查
-        """
+        # 尝试从池中获取有效密钥
         while self.valid_keys:
             key_obj = self.valid_keys.popleft()
             self._pool_keys_set.discard(key_obj.key)
-            
-            # 检查密钥状态
-            if await self._is_key_usable(key_obj, model_name):
-                # 密钥可用，进行使用次数检查
-                max_usage = self._get_max_usage_for_model(model_name)
-                usage_limit_reached = max_usage > 0 and key_obj.usage_count >= max_usage
-                
+
+            # 检查密钥是否可以使用（未过期）
+            if not key_obj.is_expired():
+                # 增加使用计数
+                key_obj.increment_usage()
+
+                self.stats["hit_count"] += 1
+                self.performance_stats["last_hit_time"] = datetime.now()
+
+                # 检查当前模型的使用次数限制
+                max_usage_for_model = self._get_max_usage_for_model(model_name) if model_name else getattr(settings, 'NON_PRO_MODEL_MAX_USAGE', 20)
+                usage_limit_reached = False
+
+                if max_usage_for_model > 0 and key_obj.usage_count >= max_usage_for_model:
+                    usage_limit_reached = True
+                    self.stats["usage_exhausted_keys_removed"] += 1
+
+                # 如果密钥未达到当前模型的使用限制，放回池中
                 if not usage_limit_reached:
-                    # 密钥可以使用
-                    if increment_usage:
-                        key_obj.increment_usage()
-                    
-                    # 放回池中
                     self.valid_keys.append(key_obj)
                     self._pool_keys_set.add(key_obj.key)
-                    
-                    # 记录命中
-                    self._record_key_hit(key_obj, max_usage)
-                    return key_obj.key
+
+                    # 记录详细的命中日志（密钥放回池中后）
+                    hit_rate = self.stats["hit_count"] / (self.stats["hit_count"] + self.stats["miss_count"]) if (self.stats["hit_count"] + self.stats["miss_count"]) > 0 else 0
+                    usage_limit_str = str(max_usage_for_model)
+                    logger.info(f"Pool hit: returned key {redact_key_for_logging(key_obj.key)}, "
+                               f"usage: {key_obj.usage_count}/{usage_limit_str}, "
+                               f"pool size: {len(self.valid_keys)}, hit rate: {hit_rate:.2%}")
                 else:
-                    # 使用次数耗尽
-                    self.stats["usage_exhausted_keys_removed"] += 1
+                    # 使用次数已达到当前模型限制，不放回池中
+                    hit_rate = self.stats["hit_count"] / (self.stats["hit_count"] + self.stats["miss_count"]) if (self.stats["hit_count"] + self.stats["miss_count"]) > 0 else 0
+                    usage_limit_str = str(max_usage_for_model)
+                    logger.info(f"Pool hit: returned key {redact_key_for_logging(key_obj.key)}, "
+                               f"usage: {key_obj.usage_count}/{usage_limit_str}, "
+                               f"pool size: {len(self.valid_keys)}, hit rate: {hit_rate:.2%} - REMOVED (usage limit reached)")
+
+                    # 只有在key被移出池子时才触发补充
                     self._trigger_refill_on_key_removal(model_name)
-                    continue
+
+                return key_obj.key
             else:
-                # 密钥不可用（过期或冷却中）
-                if key_obj.is_expired():
-                    self.stats["expired_keys_removed"] += 1
+                # 密钥已过期
+                self.stats["expired_keys_removed"] += 1
+                logger.debug(f"Removed expired key {redact_key_for_logging(key_obj.key)}")
+
+                # 过期密钥被移除时也触发补充
                 self._trigger_refill_on_key_removal(model_name)
-                continue
-        
-        # 池为空，进入紧急恢复模式
+
+        # 池为空或严重不足，记录miss并进入紧急恢复模式
+        self.stats["miss_count"] += 1
+        self.performance_stats["last_miss_time"] = datetime.now()
+
+        miss_rate = self.stats["miss_count"] / (self.stats["hit_count"] + self.stats["miss_count"]) if (self.stats["hit_count"] + self.stats["miss_count"]) > 0 else 0
+        logger.warning(f"ValidKeyPool miss: pool size {len(self.valid_keys)}, entering emergency refill mode, "
+                      f"miss rate: {miss_rate:.2%}, expired removed: {expired_count}")
+
         return await self.emergency_refill(model_name)
-
-
-    async def _is_key_usable(self, key_obj: ValidKeyWithTTL, model_name: str = None) -> bool:
-        """
-        检查密钥是否可用（未过期且未冷却）
-        """
-        if key_obj.is_expired():
-            return False
-        
-        # 检查冷却状态
-        is_in_cooldown = False
-        key_statuses = self.key_manager.key_model_status.get(key_obj.key)
-        if key_statuses:
-            now = datetime.now(pytz.utc)
-            for model, expiry_time in key_statuses.items():
-                if now < expiry_time:
-                    is_in_cooldown = True
-                    logger.debug(f"Key {redact_key_for_logging(key_obj.key)} in cooldown for model {model}")
-                    break
-        
-        return not is_in_cooldown
-
-
-    def _record_key_hit(self, key_obj: ValidKeyWithTTL, max_usage: int):
-        """
-        记录密钥命中信息
-        """
-        self.stats["hit_count"] += 1
-        self.performance_stats["last_hit_time"] = datetime.now()
-        
-        # 计算命中率和记录日志
-        hit_rate = self.stats["hit_count"] / (self.stats["hit_count"] + self.stats["miss_count"]) if (self.stats["hit_count"] + self.stats["miss_count"]) > 0 else 0
-        usage_limit_str = str(max_usage) if max_usage > 0 else "unlimited"
-        
-        logger.info(f"Pool hit: returned key {redact_key_for_logging(key_obj.key)}, "
-                   f"usage: {key_obj.usage_count}/{usage_limit_str}, "
-                   f"pool size: {len(self.valid_keys)}, hit rate: {hit_rate:.2%}")
 
     def _trigger_refill_on_key_removal(self, model_name: str = None) -> None:
         """
@@ -240,41 +219,32 @@ class ValidKeyPool:
         min_threshold = int(getattr(settings, 'POOL_MIN_THRESHOLD', 10))
         current_size = len(self.valid_keys)
 
-        # 只要低于阈值，就触发紧急补充
-        if current_size < min_threshold:
-            logger.warning(f"Pool size {current_size} is below threshold {min_threshold}, triggering emergency refill.")
-            asyncio.create_task(self.emergency_refill_async())
+        if current_size < min_threshold // 2:  # 低于阈值的一半时触发紧急补充
+            logger.warning(f"Pool size {current_size} critically low (< {min_threshold//2}), triggering emergency refill")
+            asyncio.create_task(self._persistent_emergency_refill())
         elif current_size < self.pool_size:  # 未达到最大容量时继续补充
-            # 降低触发频率，避免过度验证
-            import random
-            import time
-            
-            # 记录最后补充时间，避免短时间内频繁补充
-            last_refill_time = getattr(self, '_last_refill_time', 0)
-            current_time = time.time()
-            min_refill_interval = 5  # 最小补充间隔5秒
-            
-            if current_time - last_refill_time < min_refill_interval:
-                logger.debug(f"Skipping refill due to interval limit: {current_time - last_refill_time:.1f}s < {min_refill_interval}s")
-                return
-            
             # 循序式补充策略：每次只补充1个密钥
-            if current_size < self.pool_size * 0.8:  # 低于80%容量时
+            import random
+
+            if current_size < min_threshold:
+                # 低于阈值时，高概率补充1个
+                refill_chance = 0.9  # 90%概率补充
+                logger.info(f"Pool size {current_size} below threshold {min_threshold}, triggering sequential refill (90% chance)")
+            elif current_size < self.pool_size * 0.8:  # 低于80%容量时
                 # 根据池大小动态调整补充概率
                 if current_size < min_threshold * 1.5:  # 低于30个时
-                    refill_chance = 0.4  # 40%概率补充
+                    refill_chance = 0.7  # 70%概率补充
                 elif current_size < min_threshold * 2:  # 低于40个时
-                    refill_chance = 0.3  # 30%概率补充
+                    refill_chance = 0.5  # 50%概率补充
                 else:  # 40个以上时
-                    refill_chance = 0.2  # 20%概率补充
+                    refill_chance = 0.3  # 30%概率补充
                 logger.debug(f"Pool size {current_size} below 80% capacity, refill chance: {refill_chance*100:.0f}%")
             else:
                 # 接近满容量时，低概率补充
-                refill_chance = 0.05  # 5%概率补充
+                refill_chance = 0.1  # 10%概率补充
                 logger.debug(f"Pool size {current_size} near capacity, refill chance: {refill_chance*100:.0f}%")
 
             if random.random() < refill_chance:
-                self._last_refill_time = current_time
                 logger.info(f"Key removed from pool, current size {current_size}, triggering sequential async refill")
                 asyncio.create_task(self.async_verify_and_add(model_name))
             else:
@@ -303,20 +273,7 @@ class ValidKeyPool:
             total_keys = len(self.key_manager.api_keys)
             for key in self.key_manager.api_keys:
                 # 检查密钥是否被标记为失效
-                if not await self.key_manager.is_key_valid(key):
-                    continue
-
-                # 检查密钥是否处于冷却状态
-                is_in_cooldown = False
-                key_statuses = self.key_manager.key_model_status.get(key)
-                if key_statuses:
-                    now = datetime.now(pytz.utc)
-                    for model, expiry_time in key_statuses.items():
-                        if now < expiry_time:
-                            is_in_cooldown = True
-                            break
-                
-                if not is_in_cooldown:
+                if await self.key_manager.is_key_available_for_verification(key):
                     available_keys.append(key)
 
             logger.info(f"Key availability check: {len(available_keys)}/{total_keys} keys are valid")
@@ -327,14 +284,21 @@ class ValidKeyPool:
 
             # 选择密钥策略：优先选择未在池中的密钥
             pool_keys = self._pool_keys_set
-            unused_keys = [key for key in available_keys if key not in pool_keys and key not in self._verifying_keys]
+            unused_keys = [key for key in available_keys if key not in pool_keys]
 
-            if not unused_keys:
-                logger.info("No available keys to verify (all are either in pool or currently being verified).")
+            if unused_keys:
+                # 从未使用的密钥中随机选择
+                selected_key = random.choice(unused_keys)
+                logger.info(f"Selected unused key {redact_key_for_logging(selected_key)} from {len(unused_keys)} unused keys")
+            else:
+                # 如果所有密钥都在池中，随机选择一个
+                selected_key = random.choice(available_keys)
+                logger.info(f"All keys in use, selected key {redact_key_for_logging(selected_key)} from {len(available_keys)} available keys")
+
+            # 检查密钥是否已在池中
+            if self._is_key_in_pool(selected_key):
+                logger.info(f"Key {redact_key_for_logging(selected_key)} already in pool, skipping")
                 return
-
-            selected_key = random.choice(unused_keys)
-            logger.info(f"Selected key {redact_key_for_logging(selected_key)} for verification from {len(unused_keys)} available keys.")
 
             # 验证密钥
             verification_start = time.time()
@@ -365,134 +329,89 @@ class ValidKeyPool:
         """
         紧急恢复模式：立即返回一个候选密钥，并在后台异步验证和补充池。
         """
-        # self.stats["miss_count"] += 1 # Counting is now handled by the caller when a request ultimately fails
-        # self.performance_stats["last_miss_time"] = datetime.now()
         logger.warning("Starting non-blocking emergency refill process")
 
         # 尝试立即获取一个候选密钥返回，避免阻塞请求
-        # 使用fallback逻辑，但不触发池的验证（避免重复验证）
-        candidate_key = await self.key_manager._original_get_next_working_key(model_name)
+        candidate_key = await self.key_manager.get_next_working_key(model_name)
         logger.info(f"Immediately returning candidate key {redact_key_for_logging(candidate_key)} for the current request.")
 
         # 检查紧急补充锁，如果未锁定，则创建后台任务
         if not self.emergency_lock.locked():
             logger.info("Emergency lock is not locked, creating background refill task.")
-            asyncio.create_task(self._background_emergency_refill())
+            asyncio.create_task(self._persistent_emergency_refill())
         else:
             logger.info("Emergency refill task is already running in the background.")
 
         return candidate_key
 
-    async def _background_emergency_refill(self):
+    async def _persistent_emergency_refill(self) -> None:
         """
-        在后台执行实际的密钥验证和池补充，不阻塞主流程。
+        持续的异步紧急补充守护任务。
+        该任务会一直运行，直到池大小恢复到最低阈值。
+        使用锁来确保只有一个实例在运行。
         """
         if self.emergency_lock.locked():
-            logger.info("Background emergency refill is already in progress. Skipping.")
+            logger.info("Persistent emergency refill task is already running. Skipping.")
             return
 
         async with self.emergency_lock:
-            refill_start = time.time()
-            logger.info("Background emergency refill task started.")
+            logger.info("Starting persistent emergency refill task.")
+            self.stats["emergency_refill_count"] += 1
+            min_threshold = int(getattr(settings, 'POOL_MIN_THRESHOLD', 10))
 
-            try:
-                # 获取可能有效的密钥列表
-                available_keys = [
-                    key for key in self.key_manager.api_keys
-                    if await self.key_manager.is_key_valid(key) and not self._is_key_in_pool(key)
-                ]
+            while len(self.valid_keys) < min_threshold:
+                try:
+                    current_size = len(self.valid_keys)
+                    needed = min_threshold - current_size
+                    logger.info(f"Refill cycle started: current size {current_size}, threshold {min_threshold}, need {needed}.")
 
-                if not available_keys:
-                    logger.warning("No available keys for background emergency refill.")
-                    return
+                    # 并发验证多个密钥
+                    refill_count = min(int(settings.EMERGENCY_REFILL_COUNT), needed)
 
-                # 并发验证多个密钥
-                refill_count = min(int(settings.EMERGENCY_REFILL_COUNT), len(available_keys))
-                selected_keys = random.sample(available_keys, refill_count)
-                logger.info(f"Background refill: selected {refill_count} keys for verification.")
+                    # 获取可能有效的密钥列表
+                    available_keys = [
+                        key for key in self.key_manager.api_keys
+                        if await self.key_manager.is_key_available_for_verification(key) and not self._is_key_in_pool(key)
+                    ]
 
-                verification_tasks = [self._verify_key_for_emergency(key) for key in selected_keys]
-                results = await asyncio.gather(*verification_tasks, return_exceptions=True)
+                    if not available_keys:
+                        logger.warning("No valid API keys available for refill cycle. Waiting...")
+                        await asyncio.sleep(15)
+                        continue
 
-                # 处理验证结果
-                success_count = 0
-                for result in results:
-                    if isinstance(result, str):  # 验证成功
-                        if len(self.valid_keys) < self.pool_size:
-                            key_obj = ValidKeyWithTTL(result, self.ttl_hours)
-                            self.valid_keys.append(key_obj)
-                            self._pool_keys_set.add(key_obj.key)
-                            success_count += 1
-                            logger.info(f"Background refill: added key {redact_key_for_logging(result)} to pool")
-                        else:
-                            logger.warning("Pool size limit reached during background refill, stopping.")
-                            break
-                
-                if success_count > 0:
-                    self.stats["emergency_refill_count"] += 1
-                
-                refill_time = time.time() - refill_start
-                logger.info(f"Background emergency refill finished in {refill_time:.3f}s. "
-                           f"Successfully added {success_count}/{len(selected_keys)} keys. "
-                           f"Pool size is now {len(self.valid_keys)}.")
+                    selected_keys = random.sample(available_keys, min(refill_count, len(available_keys)))
+                    logger.info(f"Refill cycle: selected {len(selected_keys)} keys for verification.")
 
-            except Exception as e:
-                logger.error(f"An error occurred during background emergency refill: {e}", exc_info=True)
+                    # 并发验证
+                    tasks = [self._verify_key_for_emergency(key) for key in selected_keys]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def emergency_refill_async(self) -> None:
-        """
-        异步紧急补充，不返回密钥，只补充池子
-        """
-        # 使用信号量控制并发验证
-        async with self.verification_semaphore:
-            try:
-                min_threshold = int(getattr(settings, 'POOL_MIN_THRESHOLD', 10))
-                current_size = len(self.valid_keys)
-                needed = min_threshold - current_size
+                    # 处理结果
+                    success_count = 0
+                    for result in results:
+                        if isinstance(result, str):  # 验证成功返回密钥
+                            if len(self.valid_keys) >= self.pool_size:
+                                logger.warning(f"Pool size limit reached ({self.pool_size}), stopping this refill cycle.")
+                                break
+                            
+                            if not self._is_key_in_pool(result):
+                                key_obj = ValidKeyWithTTL(result, self.ttl_hours)
+                                self.valid_keys.append(key_obj)
+                                self._pool_keys_set.add(key_obj.key)
+                                success_count += 1
 
-                if needed <= 0:
-                    return
+                    logger.info(f"Refill cycle completed: added {success_count} keys, pool size now: {len(self.valid_keys)}.")
 
-                logger.info(f"Starting emergency async refill: need {needed} keys to reach threshold {min_threshold}")
+                    # 如果没有成功添加任何密钥，并且池仍然需要补充，则等待
+                    if success_count == 0 and len(self.valid_keys) < min_threshold:
+                        logger.info("No keys were added in this cycle. Waiting before next attempt.")
+                        await asyncio.sleep(15)
 
-                # 并发验证多个密钥
-                refill_count = min(int(settings.EMERGENCY_REFILL_COUNT), needed)
+                except Exception as e:
+                    logger.error(f"An error occurred during persistent refill cycle: {e}", exc_info=True)
+                    await asyncio.sleep(15)  # 发生异常后也等待
 
-                # 获取可能有效的密钥列表
-                available_keys = []
-                for key in self.key_manager.api_keys:
-                    if await self.key_manager.is_key_valid(key):
-                        available_keys.append(key)
-
-                if not available_keys:
-                    logger.warning("No valid API keys available for emergency async refill")
-                    return
-
-                selected_keys = random.sample(available_keys, min(refill_count, len(available_keys)))
-                logger.info(f"Emergency async refill: selected {len(selected_keys)} keys for verification")
-
-                # 并发验证
-                tasks = [self._verify_key_for_emergency(key) for key in selected_keys]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-
-                # 处理结果
-                success_count = 0
-                for result in results:
-                    if isinstance(result, str):  # 验证成功返回密钥
-                        # 检查池大小限制
-                        if len(self.valid_keys) >= self.pool_size:
-                            logger.warning(f"Pool size limit reached ({self.pool_size}), skipping additional keys in emergency async refill")
-                            break
-
-                        key_obj = ValidKeyWithTTL(result, self.ttl_hours)
-                        self.valid_keys.append(key_obj)
-                        self._pool_keys_set.add(key_obj.key)
-                        success_count += 1
-
-                logger.info(f"Emergency async refill completed: added {success_count} keys, pool size now: {len(self.valid_keys)}")
-
-            except Exception as e:
-                logger.error(f"Emergency async refill failed: {e}")
+            logger.info(f"Persistent emergency refill task finished. Pool size {len(self.valid_keys)} has reached threshold {min_threshold}.")
 
     async def _validate_pool_keys(self) -> None:
         """
@@ -513,6 +432,18 @@ class ValidKeyPool:
         removed_count = 0
         for key_obj in keys_to_validate:
             try:
+                # 检查密钥是否已过宽限期
+                grace_period_minutes = 5
+                if datetime.now() - key_obj.created_at < timedelta(minutes=grace_period_minutes):
+                    logger.debug(f"Key {redact_key_for_logging(key_obj.key)} is within the grace period, skipping validation.")
+                    continue
+
+                # 检查密钥是否已过宽限期
+                grace_period_minutes = settings.KEY_VALIDATION_GRACE_PERIOD_MINUTES
+                if datetime.now() - key_obj.created_at < timedelta(minutes=grace_period_minutes):
+                    logger.debug(f"Key {redact_key_for_logging(key_obj.key)} is within the grace period, skipping validation.")
+                    continue
+
                 # 检查密钥是否过期
                 if key_obj.is_expired():
                     # This is slow, but keys_to_validate is small.
@@ -522,9 +453,14 @@ class ValidKeyPool:
                     logger.debug(f"Removed expired key {redact_key_for_logging(key_obj.key)}")
                     continue
 
-                # 池内密钥本来就已经验证过有效，只需要检查TTL过期
-                # 不需要重复验证，避免消耗使用次数
-                continue
+                # 验证密钥是否仍然有效
+                is_valid = await self._verify_key(key_obj.key)
+                if not is_valid:
+                    # This is slow, but keys_to_validate is small.
+                    self.valid_keys.remove(key_obj)
+                    self._pool_keys_set.discard(key_obj.key)
+                    removed_count += 1
+                    logger.info(f"Removed invalid key {redact_key_for_logging(key_obj.key)} from pool")
 
             except Exception as e:
                 logger.warning(f"Error validating key {redact_key_for_logging(key_obj.key)}: {e}")
@@ -546,36 +482,48 @@ class ValidKeyPool:
         """
         self.stats["total_verifications"] += 1
         
-        if key in self._verifying_keys:
-            logger.warning(f"Key {redact_key_for_logging(key)} is already being verified. Skipping duplicate verification.")
-            return False
-            
-        self._verifying_keys.add(key)
         try:
             if not self.chat_service:
                 logger.warning("Chat service not available for key verification")
-                self._verifying_keys.discard(key)
                 return False
             
-            # 使用新的、无副作用的验证方法
-            verification_result = await self.chat_service._verify_key_with_api(key)
+            # 构造测试请求
+            gemini_request = GeminiRequest(
+                contents=[
+                    GeminiContent(
+                        role="user",
+                        parts=[{"text": "hi"}],
+                    )
+                ]
+            )
             
-            if verification_result is None:
-                # 验证成功
-                await self.key_manager.reset_key_failure_count(key)
-                logger.debug(f"Key verification successful for {redact_key_for_logging(key)}")
-                return True
-            else:
-                # 验证失败，处理异常
-                logger.debug(f"Key verification failed for {redact_key_for_logging(key)}: {str(verification_result)}")
-                await self.error_processor.process_error(key, verification_result, settings.TEST_MODEL)
-                return False
+            # 发送验证请求
+            await self.chat_service.generate_content(
+                settings.TEST_MODEL, gemini_request, key
+            )
+            
+            # 验证成功，重置失败计数
+            await self.key_manager.reset_key_failure_count(key)
+            logger.debug(f"Key verification successful for {redact_key_for_logging(key)}")
+            return True
+            
         except asyncio.CancelledError:
             # 任务被取消，不记录为验证失败
             logger.debug(f"Key verification cancelled for {redact_key_for_logging(key)}")
             raise  # 重新抛出CancelledError
-        finally:
-            self._verifying_keys.discard(key)
+        except Exception as e:
+            logger.debug(f"Key verification failed for {redact_key_for_logging(key)}: {str(e)}")
+
+            # 调用通用错误处理器
+            await handle_api_error_and_get_next_key(
+                key_manager=self.key_manager,
+                error=e,
+                old_key=key,
+                model_name=settings.TEST_MODEL,
+                retries=self.key_manager.MAX_FAILURES,
+                source="key_validation",
+            )
+            return False
     
     async def _verify_key_for_emergency(self, key: str) -> Optional[str]:
         """
@@ -587,29 +535,47 @@ class ValidKeyPool:
         Returns:
             Optional[str]: 验证成功返回密钥，失败返回None
         """
-        self.stats["total_verifications"] += 1
         try:
             if not self.chat_service:
                 logger.warning("Chat service not available for emergency key verification")
                 return None
 
-            # 紧急验证方法返回布尔值：True表示成功，False表示失败
-            is_valid = await self.chat_service._verify_key_with_api(key)
-            if is_valid:
-                # 验证成功
-                self.stats["successful_verifications"] += 1
-                await self.key_manager.reset_key_failure_count(key)
-                logger.debug(f"Emergency key verification successful for {redact_key_for_logging(key)}")
-                return key
-            else:
-                # 验证失败
-                self.stats["verification_failures"] += 1
-                # 验证失败，返回None
-                return None
+            # 构造测试请求
+            gemini_request = GeminiRequest(
+                contents=[
+                    GeminiContent(
+                        role="user",
+                        parts=[{"text": "hi"}],
+                    )
+                ]
+            )
+
+            # 发送验证请求（不调用错误处理器，避免递归）
+            await self.chat_service.generate_content(
+                settings.TEST_MODEL, gemini_request, key
+            )
+
+            # 验证成功，重置失败计数
+            await self.key_manager.reset_key_failure_count(key)
+            logger.debug(f"Emergency key verification successful for {redact_key_for_logging(key)}")
+            return key
+
         except asyncio.CancelledError:
             # 任务被取消
             logger.debug(f"Emergency key verification cancelled for {redact_key_for_logging(key)}")
             raise
+        except Exception as e:
+            # 调用通用错误处理器来记录日志和处理密钥状态
+            logger.debug(f"Emergency key verification failed for {redact_key_for_logging(key)}: {str(e)}")
+            await handle_api_error_and_get_next_key(
+                key_manager=self.key_manager,
+                error=e,
+                old_key=key,
+                model_name=settings.TEST_MODEL,
+                retries=self.key_manager.MAX_FAILURES,  # 传递高重试次数以确保必要时标记为失败
+                source="key_validation",
+            )
+            return None
 
     def _remove_expired_keys(self) -> int:
         """
@@ -623,7 +589,6 @@ class ValidKeyPool:
         # 遍历当前池，分离出未过期的和已过期的
         while self.valid_keys:
             key_obj = self.valid_keys.popleft()
-            self.stats["keys_checked_for_expiration"] += 1
             # The key is always removed from the set here.
             # If it's not expired, it will be added back to both deque and set.
             self._pool_keys_set.discard(key_obj.key)
@@ -717,19 +682,19 @@ class ValidKeyPool:
         if current_size < self.pool_size:
             # 温和的循序补充策略：根据池大小决定补充数量
             if current_size < min_threshold:
-                # 低于阈值时，补充2-3个密钥（降低补充数量）
-                refill_target = min(3, self.pool_size - current_size)
+                # 低于阈值时，补充3-5个密钥
+                refill_target = min(5, self.pool_size - current_size)
             elif current_size < self.pool_size * 0.7:
-                # 低于70%容量时，补充1-2个密钥
-                refill_target = min(2, self.pool_size - current_size)
+                # 低于70%容量时，补充2-3个密钥
+                refill_target = min(3, self.pool_size - current_size)
             else:
-                # 接近满容量时，只补充1个密钥
-                refill_target = min(1, self.pool_size - current_size)
+                # 接近满容量时，只补充1-2个密钥
+                refill_target = min(2, self.pool_size - current_size)
 
             logger.info(f"Pool maintenance: current {current_size}/{self.pool_size}, will add {refill_target} keys (sequential)")
 
             refill_attempt = 0
-            max_refill_attempts = refill_target * 2  # 降低重试次数
+            max_refill_attempts = refill_target * 3  # 允许一些失败重试
 
             while refilled_count < refill_target and refill_attempt < max_refill_attempts:
                 try:
@@ -743,7 +708,7 @@ class ValidKeyPool:
 
                     refill_attempt += 1
                     # 增加延迟，避免过于频繁的验证
-                    await asyncio.sleep(1.0)  # 增加到1秒延迟
+                    await asyncio.sleep(0.5)  # 从0.1秒增加到0.5秒
 
                 except asyncio.CancelledError:
                     logger.info(f"Pool maintenance cancelled during refill attempt {refill_attempt}")
@@ -754,14 +719,9 @@ class ValidKeyPool:
         else:
             logger.info(f"Pool size ({current_size}) at capacity ({self.pool_size}), no refill needed")
 
-        # 减少池内密钥验证频率，只在维护间隔较长时执行
-        # 只在池中密钥数量较少时才进行验证，避免过度验证
-        if current_size > 0 and current_size < min_threshold:
-            await self._validate_pool_keys()
-        elif self.stats["maintenance_count"] % 5 == 0:  # 每5次维护才验证一次
-            await self._validate_pool_keys()
-        else:
-            logger.debug("Skipping pool validation to avoid excessive verification")
+        # 定期验证池内密钥，清理失效的密钥
+        # await self._validate_pool_keys() # 此功能在高并发时可能导致问题，暂时禁用
+                    # 继续尝试下一个密钥
 
         maintenance_time = time.time() - maintenance_start
         final_size = len(self.valid_keys)
@@ -823,9 +783,8 @@ class ValidKeyPool:
 
         # 计算TTL过期率
         ttl_expiry_rate = 0.0
-        total_checked = self.stats.get("keys_checked_for_expiration", 0)
-        if total_checked > 0:
-            ttl_expiry_rate = self.stats["expired_keys_removed"] / total_checked
+        if self.stats["expired_keys_removed"] > 0 and total_requests > 0:
+            ttl_expiry_rate = self.stats["expired_keys_removed"] / (self.stats["expired_keys_removed"] + self.stats["hit_count"])
 
         return {
             # 基本池信息
@@ -882,17 +841,17 @@ class ValidKeyPool:
 
         logger.info(f"Starting pool preload, target size: {target_size}")
 
-        # 使用并发验证提高预加载效率
-        batch_size = min(10, target_size)  # 每批验证10个
-        total_loaded = 0
+        # 使用信号量控制并发验证
+        async with self.verification_semaphore:
+            # 使用并发验证提高预加载效率
+            batch_size = min(10, target_size)  # 每批验证10个
+            total_loaded = 0
 
-        while len(self.valid_keys) < target_size and total_loaded < target_size * 2:
-            # 使用信号量控制每个批次的并发验证
-            async with self.verification_semaphore:
+            while len(self.valid_keys) < target_size and total_loaded < target_size * 2:
                 # 获取可用密钥
                 available_keys = []
                 for key in self.key_manager.api_keys:
-                    if await self.key_manager.is_key_valid(key) and not self._is_key_in_pool(key):
+                    if await self.key_manager.is_key_available_for_verification(key) and not self._is_key_in_pool(key):
                         available_keys.append(key)
 
                 if not available_keys:
@@ -921,6 +880,7 @@ class ValidKeyPool:
                         self._pool_keys_set.add(key_obj.key)
                         batch_loaded += 1
                         total_loaded += 1
+                        logger.info(f"Key {redact_key_for_logging(result)} preloaded successfully.")
 
                 logger.info(f"Preload batch completed: loaded {batch_loaded}/{len(batch_keys)} keys, pool size: {len(self.valid_keys)}")
 
@@ -929,6 +889,14 @@ class ValidKeyPool:
                     break
 
         logger.info(f"Pool preload completed. Loaded {len(self.valid_keys)} keys")
+
+        # 检查预加载后池大小是否低于最小阈值
+        min_threshold = int(getattr(settings, 'POOL_MIN_THRESHOLD', 10))
+        if len(self.valid_keys) < min_threshold:
+            logger.warning(f"Pool size after preload ({len(self.valid_keys)}) is below the minimum threshold ({min_threshold}). "
+                           f"Triggering an emergency async refill.")
+            asyncio.create_task(self._persistent_emergency_refill())
+
         return len(self.valid_keys)
 
     def log_performance_summary(self) -> None:
@@ -973,8 +941,7 @@ class ValidKeyPool:
             "verification_failures": 0,
             "usage_exhausted_keys_removed": 0,  # 因使用次数耗尽而移除的密钥数
             "pro_model_requests": 0,  # Pro模型请求数
-            "non_pro_model_requests": 0,  # 非Pro模型请求数
-            "keys_checked_for_expiration": 0
+            "non_pro_model_requests": 0  # 非Pro模型请求数
         }
 
         self.performance_stats = {
@@ -984,36 +951,3 @@ class ValidKeyPool:
             "total_get_key_calls": 0,
             "avg_verification_time": 0.0
         }
-
-    def remove_key(self, key_to_remove: str) -> bool:
-        """
-        Removes a key from the pool and then triggers the probabilistic replenishment logic.
-        This is the single, unified entry point for removing a key from the pool.
-        """
-        initial_size = len(self.valid_keys)
-        
-        # Create a new deque without the key to remove
-        new_keys = deque(
-            key_obj for key_obj in self.valid_keys if key_obj.key != key_to_remove
-        )
-        
-        if len(new_keys) < initial_size:
-            self.valid_keys = new_keys
-            self._pool_keys_set.discard(key_to_remove)
-            logger.info(f"Key {redact_key_for_logging(key_to_remove)} removed from pool. Current size: {len(self.valid_keys)}")
-            
-            # Now, trigger the internal replenishment logic
-            self._trigger_refill_on_key_removal()
-            return True
-            
-        return False
-
-    def record_miss(self):
-        """
-        Records a pool miss event. This should be called when the entire request
-        (including all retries) fails to find a working key.
-        """
-        self.stats["miss_count"] += 1
-        self.performance_stats["last_miss_time"] = datetime.now()
-        logger.warning("Pool miss recorded. A request failed after all retries.")
-

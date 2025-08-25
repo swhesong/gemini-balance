@@ -33,47 +33,40 @@ async function fetchAPI(url, options = {}) {
     const response = await fetch(url, options);
 
     if (response.status === 204) {
-      return null; // Indicate success with no content for DELETE etc.
+      return null;
     }
 
+    // First, get the response body as text, as this is the most robust method.
+    const responseText = await response.text();
+
+    // Now, try to parse the text as JSON.
     let responseData;
     try {
-      // Clone the response to allow reading it multiple times if needed (e.g., for text fallback)
-      const clonedResponse = response.clone();
-      responseData = await response.json();
+        responseData = JSON.parse(responseText);
     } catch (e) {
-      // If JSON parsing fails, try to get text, especially if response wasn't ok
-      if (!response.ok) {
-        const textResponse = await response.text(); // Use original response for text
-        throw new Error(
-          textResponse ||
-            `HTTP error! status: ${response.status} - ${response.statusText}`
-        );
-      }
-      // If response is ok but not JSON, maybe return raw text or handle differently
-      console.warn("Response was not JSON for URL:", url);
-      // Consider returning text or null based on expected non-JSON success cases
-      return await response.text(); // Example: return text for non-JSON success
+        // If JSON parsing fails and the response was not OK, throw the raw text as the error.
+        if (!response.ok) {
+            throw new Error(responseText || `HTTP error! status: ${response.status} - ${response.statusText}`);
+        }
+        // If the response was OK but not valid JSON, it might be an intentional text response.
+        console.warn("Response was not JSON for URL:", url);
+        return responseText; // Return the raw text.
     }
 
     if (!response.ok) {
-      // Prefer error message from API response body (already parsed as JSON)
+      // If the response is not OK, use the parsed JSON for a detailed error message if available.
       let message = responseData?.detail || responseData?.message || responseData?.error;
-
-      // 如果 message 是对象，尝试转换为字符串
       if (typeof message === 'object' && message !== null) {
         message = JSON.stringify(message);
       }
-
-      // 如果还是没有有效消息，使用默认错误信息
       if (!message || typeof message !== 'string') {
-        message = `HTTP error! status: ${response.status}`;
+        // Fallback to the raw text or status code if no detailed message is found.
+        message = responseText || `HTTP error! status: ${response.status}`;
       }
-
       throw new Error(message);
     }
 
-    return responseData; // Return parsed JSON data
+    return responseData; // On success, return the parsed JSON.
   } catch (error) {
     console.error(
       "API Call Failed:",
@@ -156,11 +149,8 @@ function updateBatchActions(type) {
   );
   if (selectAllCheckbox && visibleCheckboxes.length > 0) {
     selectAllCheckbox.checked = count === visibleCheckboxes.length;
-    selectAllCheckbox.indeterminate =
-      count > 0 && count < visibleCheckboxes.length;
   } else if (selectAllCheckbox) {
     selectAllCheckbox.checked = false;
-    selectAllCheckbox.indeterminate = false;
   }
 }
 
@@ -184,8 +174,6 @@ function toggleSelectAll(type, isChecked) {
   const rootId = type === 'attention' ? 'attentionKeysList' : `${type}Keys`;
   const listElement = document.getElementById(rootId);
   if (!listElement) return;
-  // Select checkboxes within LI elements that are NOT styled with display:none
-  // This targets currently visible items based on filtering.
   const visibleCheckboxes = listElement.querySelectorAll(
     `li:not([style*="display: none"]) .key-checkbox`
   );
@@ -196,11 +184,9 @@ function toggleSelectAll(type, isChecked) {
     if (listItem) {
       listItem.classList.toggle("selected", isChecked);
       if (type !== 'attention') {
-        // Sync with master array
         const key = listItem.dataset.key;
         const masterList = type === "valid" ? allValidKeys : allInvalidKeys;
         if (masterList) {
-          // Ensure masterList is defined
           const masterListItem = masterList.find((li) => li.dataset.key === key);
           if (masterListItem) {
             const masterCheckbox = masterListItem.querySelector(".key-checkbox");
@@ -1223,32 +1209,9 @@ function initializeKeySelectionListeners() {
       const listItem = event.target.closest("li[data-key]");
       if (!listItem) return;
 
-      // If the click was directly on the checkbox, let the 'change' event handle it.
-      if (event.target.classList.contains('key-checkbox')) {
+      // If the click was directly on the checkbox, or on a button/link, let the native behavior handle it.
+      if (event.target.closest("button, a, input[type='button'], input[type='submit'], .key-checkbox")) {
           return;
-      }
-
-      // Do not toggle if a button, a link, or any element explicitly designed for interaction within the li was clicked
-      if (
-        event.target.closest(
-          "button, a, input[type='button'], input[type='submit']"
-        )
-      ) {
-        let currentTarget = event.target;
-        let isInteractiveElementClick = false;
-        while (currentTarget && currentTarget !== listItem) {
-          if (
-            currentTarget.tagName === "BUTTON" ||
-            currentTarget.tagName === "A" ||
-            (currentTarget.tagName === "INPUT" &&
-              ["button", "submit"].includes(currentTarget.type))
-          ) {
-            isInteractiveElementClick = true;
-            break;
-          }
-          currentTarget = currentTarget.parentElement;
-        }
-        if (isInteractiveElementClick) return;
       }
 
       const checkbox = listItem.querySelector(".key-checkbox");
@@ -1597,7 +1560,8 @@ function buildChartConfig(labels, successData, failureData) {
 
 async function fetchPeriodDetails(period) {
   // Uses backend endpoint /api/stats/details?period={period}
-  return await fetchAPI(`/api/stats/details?period=${period}`);
+  // For chart rendering, always fetch all data for the period.
+  return await fetchAPI(`/api/stats/details?period=${period}&all=true`);
 }
 
 function bucketizeDetails(period, details) {
@@ -1692,43 +1656,37 @@ async function fetchAndRenderAttentionKeys(statusCode = 429, limit = 10) {
     listEl.innerHTML = '';
     if (!data || (Array.isArray(data) && data.length === 0) || data.error) {
       listEl.innerHTML = '<li class="text-center text-gray-500 py-2">暂无需要注意的Key</li>';
-      updateBatchActions('attention');
       return;
     }
     data.forEach(item => {
       const li = document.createElement('li');
-      li.className = 'flex items-center justify-between bg-white rounded border px-3 py-2';
-      li.dataset.key = item.key || '';
+      li.className = 'flex items-center bg-white rounded border px-3 py-2';
+      li.dataset.key = item.key;
       const masked = item.key ? `${item.key.substring(0,4)}...${item.key.substring(item.key.length-4)}` : 'N/A';
       const code = item.status_code ?? statusCode;
       li.innerHTML = `
-        <div class="flex items-center gap-3">
-          <input type="checkbox" class="form-checkbox h-4 w-4 text-primary-600 border-gray-300 rounded key-checkbox" value="${item.key || ''}">
-          <span class="font-mono text-sm">${masked}</span>
-          <span class="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">${code}: ${item.count}</span>
-        </div>
-        <div class="flex items-center gap-2">
-          <button class="px-2 py-1 text-xs rounded bg-success-600 hover:bg-success-700 text-white" title="验证此Key">验 证</button>
-          <button class="px-2 py-1 text-xs rounded bg-blue-600 hover:bg-blue-700 text-white" title="查看24小时详情">详情</button>
-          <button class="px-2 py-1 text-xs rounded bg-blue-500 hover:bg-blue-600 text-white" title="复制Key">复制</button>
-          <button class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-900 text-white" title="删除此Key">删除</button>
+        <input type="checkbox" class="form-checkbox h-5 w-5 text-primary-600 border-gray-300 rounded focus:ring-primary-500 mr-4 key-checkbox" data-key-type="attention" value="${item.key}">
+        <div class="flex-grow flex items-center justify-between">
+            <div class="flex items-center gap-3">
+                <span class="font-mono text-sm">${masked}</span>
+                <span class="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded">${code}: ${item.count}</span>
+            </div>
+            <div class="flex items-center gap-2">
+                <button class="px-2 py-1 text-xs rounded bg-success-600 hover:bg-success-700 text-white" title="验证此Key">验证</button>
+                <button class="px-2 py-1 text-xs rounded bg-blue-600 hover:bg-blue-700 text-white" title="查看24小时详情">详情</button>
+                <button class="px-2 py-1 text-xs rounded bg-blue-500 hover:bg-blue-600 text-white" title="复制Key">复制</button>
+                <button class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-900 text-white" title="删除此Key">删除</button>
+            </div>
         </div>`;
       const [verifyBtn, detailBtn, copyBtn, deleteBtn] = li.querySelectorAll('button');
-      verifyBtn.addEventListener('click', (e) => { e.stopPropagation(); verifyKey(item.key, e.currentTarget); });
-      detailBtn.addEventListener('click', (e) => { e.stopPropagation(); window.showKeyUsageDetails(item.key); });
-      copyBtn.addEventListener('click', (e) => { e.stopPropagation(); copyKey(item.key); });
-      deleteBtn.addEventListener('click', (e) => { e.stopPropagation(); showSingleKeyDeleteConfirmModal(item.key, e.currentTarget); });
-      // Checkbox change updates batch actions
-      const checkbox = li.querySelector('.key-checkbox');
-      if (checkbox) {
-        checkbox.addEventListener('change', () => updateBatchActions('attention'));
-      }
+      verifyBtn.addEventListener('click', (e) => verifyKey(item.key, e.currentTarget));
+      detailBtn.addEventListener('click', () => window.showKeyUsageDetails(item.key));
+      copyBtn.addEventListener('click', () => copyKey(item.key));
+      deleteBtn.addEventListener('click', (e) => showSingleKeyDeleteConfirmModal(item.key, e.currentTarget));
       listEl.appendChild(li);
     });
-    updateBatchActions('attention');
   } catch (e) {
     listEl.innerHTML = `<li class="text-center text-red-500 py-2">加载失败: ${e.message}</li>`;
-    updateBatchActions('attention');
   }
 }
 
@@ -1975,11 +1933,15 @@ async function executeDeleteSelectedKeys(type) {
       showNotification(message, "success");
 
       if (type === 'attention') {
-        // 对于 "attention" 列表，直接重新获取数据以刷新
-        fetchAndRenderAttentionKeys(currentStatus, getLimit());
+        // 对于“值得注意的Key”列表，完全重新获取和渲染以确保数据一致性
+        setTimeout(() => {
+          fetchAndRenderAttentionKeys(currentStatus, getLimit());
+          updateBatchActions('attention'); // 重新获取后更新批量操作栏
+        }, 350); // 延迟以显示通知
       } else {
-        // 对于 "valid" 和 "invalid" 列表，使用现有的 DOM 操作逻辑
-        const listElement = document.getElementById(`${type}Keys`);
+        // 对于有效/无效列表，从DOM中移除元素
+        const listId = `${type}Keys`;
+        const listElement = document.getElementById(listId);
         if (listElement) {
             selectedKeys.forEach(key => {
               const listItem = listElement.querySelector(`li[data-key="${key}"]`);
@@ -1995,13 +1957,11 @@ async function executeDeleteSelectedKeys(type) {
         }
         // 更新卡片头部的计数
         updateCardHeaderCount(type, -selectedKeys.length);
+        // 短暂延迟后更新批量操作UI
+        setTimeout(() => {
+            updateBatchActions(type);
+        }, 350);
       }
-      
-      // 短暂延迟后更新批量操作UI，确保移除动画有机会开始
-      setTimeout(() => {
-          updateBatchActions(type);
-      }, 350);
-      
     } else {
       showResultModal(false, response.message || "批量删除密钥失败", false); // false 表示失败，message，false 表示关闭后不刷新
     }

@@ -2,7 +2,6 @@ import asyncio
 import random
 from itertools import cycle
 from typing import Dict, Union, Optional
-from collections import deque
 from datetime import datetime, timedelta
 import pytz
 
@@ -30,6 +29,7 @@ class KeyManager:
         self.key_model_status: Dict[str, Dict[str, datetime]] = {}
         self.MAX_FAILURES = settings.MAX_FAILURES
         self.paid_key = settings.PAID_KEY
+        settings.GEMINI_QUOTA_RESET_HOUR = int(settings.GEMINI_QUOTA_RESET_HOUR)
 
         # 初始化有效密钥池
         self.valid_key_pool = None
@@ -37,8 +37,6 @@ class KeyManager:
             try:
                 # 延迟导入避免循环依赖
                 from app.service.key.valid_key_pool import ValidKeyPool
-                from app.handler.error_processor import ErrorProcessor
-                from app.service.model.model_service import ModelService
 
                 # 确保配置值为整数类型（修复Pydantic警告）
                 pool_size = int(settings.VALID_KEY_POOL_SIZE)
@@ -51,13 +49,10 @@ class KeyManager:
                 settings.EMERGENCY_REFILL_COUNT = int(settings.EMERGENCY_REFILL_COUNT)
                 settings.POOL_MAINTENANCE_INTERVAL_MINUTES = int(settings.POOL_MAINTENANCE_INTERVAL_MINUTES)
 
-                model_service = ModelService()
-                self.error_processor = ErrorProcessor(self, model_service)
                 self.valid_key_pool = ValidKeyPool(
                     pool_size=pool_size,
                     ttl_hours=ttl_hours,
-                    key_manager=self,
-                    error_processor=self.error_processor
+                    key_manager=self
                 )
                 logger.info(f"ValidKeyPool initialized successfully with pool_size={pool_size}, ttl_hours={ttl_hours}")
             except Exception as e:
@@ -120,7 +115,7 @@ class KeyManager:
             return self.valid_key_pool.get_pool_stats()
         return None
 
-    async def _get_next_key_in_cycle(self) -> Optional[str]:
+    async def get_next_key(self) -> Optional[str]:
         """获取下一个有效的API key，使用索引循环"""
         async with self.failure_count_lock: # Re-using lock for simplicity
             if not self.valid_api_keys:
@@ -133,21 +128,6 @@ class KeyManager:
             key = self.valid_api_keys[self.key_index]
             self.key_index = (self.key_index + 1) % len(self.valid_api_keys)
             return key
-
-    async def get_next_key(self, current_key: str) -> Optional[str]:
-        """
-        获取当前密钥之后的下一个有效密钥
-        """
-        async with self.failure_count_lock:
-            if not self.valid_api_keys:
-                return None
-            try:
-                current_index = self.valid_api_keys.index(current_key)
-                next_index = (current_index + 1) % len(self.valid_api_keys)
-                return self.valid_api_keys[next_index]
-            except ValueError:
-                # If current_key is not in the list, return the first one
-                return self.valid_api_keys[0]
 
     async def get_next_vertex_key(self) -> str:
         """获取下一个 Vertex Express API key"""
@@ -163,6 +143,28 @@ class KeyManager:
         """检查 Vertex key 是否有效"""
         async with self.vertex_failure_count_lock:
             return self.vertex_key_failure_counts[key] < self.MAX_FAILURES
+
+    async def is_key_available_for_verification(self, key: str) -> bool:
+        """
+        检查一个密钥是否可用于验证。
+        一个密钥可用，前提是它没有被永久禁用，并且没有因为测试模型而处于冷却状态。
+        """
+        async with self.failure_count_lock:
+            # 1. 检查是否被永久禁用
+            if self.key_failure_counts.get(key, 0) >= self.MAX_FAILURES:
+                return False
+
+            # 2. 检查是否因测试模型而处于冷却状态
+            test_model = settings.TEST_MODEL
+            now = datetime.now(pytz.utc)
+            model_statuses = self.key_model_status.get(key, {})
+            expiry_time = model_statuses.get(test_model)
+            
+            if expiry_time and now < expiry_time:
+                # 对于测试模型，它正处于冷却期，因此不可用于验证
+                return False
+
+            return True
 
     async def reset_failure_counts(self):
         """重置所有key的失败计数"""
@@ -188,7 +190,7 @@ class KeyManager:
                 logger.info(f"Reset failure count for key: {redact_key_for_logging(key)}")
                 return True
             logger.warning(
-                f"Attempt to reset failure count for non-existent key: {redact_key_for_logging(key)}"
+                f"Attempt to reset failure count for non-existent key: {key}"
             )
             return False
 
@@ -200,7 +202,7 @@ class KeyManager:
                 logger.info(f"Reset failure count for Vertex key: {redact_key_for_logging(key)}")
                 return True
             logger.warning(
-                f"Attempt to reset failure count for non-existent Vertex key: {redact_key_for_logging(key)}"
+                f"Attempt to reset failure count for non-existent Vertex key: {key}"
             )
             return False
 
@@ -291,10 +293,9 @@ class KeyManager:
             tz = pytz.utc
 
         now = datetime.now(tz)
-        reset_hour = settings.GEMINI_QUOTA_RESET_HOUR
+        reset_hour = int(settings.GEMINI_QUOTA_RESET_HOUR)
         
         # 计算下一个重置时间
-        reset_hour = int(reset_hour)
         reset_time_today = now.replace(hour=reset_hour, minute=0, second=0, microsecond=0)
         if now >= reset_time_today:
             # 如果当前时间已经超过今天的重置时间，则下一个重置点是明天
@@ -307,7 +308,7 @@ class KeyManager:
             self.key_model_status[api_key] = {}
         
         self.key_model_status[api_key][model_name] = next_reset_time.astimezone(pytz.utc)
-        logger.info(f"Key {redact_key_for_logging(api_key)} for model {model_name} has been put into cooldown until {next_reset_time} ({settings.TIMEZONE}).")
+        logger.info(f"Key {api_key} for model {model_name} has been put into cooldown until {next_reset_time} ({settings.TIMEZONE}).")
 
     async def mark_key_as_failed(self, api_key: str):
         """立即将一个key标记为失败状态"""
@@ -320,36 +321,20 @@ class KeyManager:
                 logger.warning(f"API key {redact_key_for_logging(api_key)} has been marked as failed immediately due to a critical error (e.g., 403).")
 
     async def handle_api_failure(self, api_key: str, retries: int, model_name: str = None) -> str:
-        """
-        重构API失败处理方法，确保与统一错误处理逻辑一致
-        """
+        """处理API调用失败"""
         async with self.failure_count_lock:
             self.key_failure_counts[api_key] += 1
-            
-            # 如果超过最大失败次数，标记密钥失效
             if self.key_failure_counts[api_key] >= self.MAX_FAILURES:
-                logger.warning(f"API key {redact_key_for_logging(api_key)} exceeded max failures, marking as failed.")
+                logger.warning(
+                    f"API key {redact_key_for_logging(api_key)} has failed {self.MAX_FAILURES} times and is being removed from the valid pool."
+                )
+                # Remove from valid list
                 if api_key in self.valid_api_keys:
                     self.valid_api_keys.remove(api_key)
-        
-        # 根据重试次数决定是否返回新密钥
         if retries < settings.MAX_RETRIES:
             return await self.get_next_working_key(model_name=model_name)
         else:
             return ""
-
-    async def increment_failure_count(self, api_key: str):
-        """
-        增加指定key的失败计数，并在达到阈值时将其从有效列表中移除
-        """
-        async with self.failure_count_lock:
-            if api_key in self.key_failure_counts:
-                self.key_failure_counts[api_key] += 1
-                logger.info(f"Increased failure count for key {redact_key_for_logging(api_key)} to {self.key_failure_counts[api_key]}.")
-                if self.key_failure_counts[api_key] >= self.MAX_FAILURES:
-                    if api_key in self.valid_api_keys:
-                        self.valid_api_keys.remove(api_key)
-                        logger.warning(f"API key {redact_key_for_logging(api_key)} exceeded max failures ({self.MAX_FAILURES}), removing from valid pool.")
 
     async def handle_vertex_api_failure(self, api_key: str, retries: int) -> str:
         """处理 Vertex Express API 调用失败"""
@@ -518,35 +503,28 @@ class KeyManager:
 
     async def remove_key_from_pool(self, key_to_remove: str):
         """
-        优化池中密钥移除逻辑，确保线程安全和一致性
+        仅从 ValidKeyPool 中移除一个密钥，不影响其在主列表中的状态。
+        用于密钥因临时问题（如速率限制）需要暂时移出活跃池的场景。
         """
-        if self.valid_key_pool:
-            # Delegate removal to the pool itself to trigger its internal logic
-            return self.valid_key_pool.remove_key(key_to_remove)
+        if self.valid_key_pool and self.valid_key_pool.valid_keys:
+            async with self.failure_count_lock: # Use a lock to protect pool access
+                initial_pool_size = len(self.valid_key_pool.valid_keys)
+                
+                from collections import deque
+                filtered_keys = deque(
+                    key_obj for key_obj in self.valid_key_pool.valid_keys if key_obj.key != key_to_remove
+                )
+                
+                if len(filtered_keys) < initial_pool_size:
+                    self.valid_key_pool.valid_keys = filtered_keys
+                    
+                    if hasattr(self.valid_key_pool, '_pool_keys_set') and key_to_remove in self.valid_key_pool._pool_keys_set:
+                        self.valid_key_pool._pool_keys_set.remove(key_to_remove)
+                    
+                    logger.info(f"Key '{redact_key_for_logging(key_to_remove)}' temporarily removed from ValidKeyPool.")
+                    return True
         return False
 
-    async def record_pool_miss(self):
-        """
-        记录一次密钥池未命中
-        """
-        if self.valid_key_pool:
-            self.valid_key_pool.record_miss()
-
-    async def validate_gemini_key(self, key: str) -> bool:
-        """
-        验证单个Gemini密钥的有效性
-        """
-        try:
-            # 确保聊天服务已设置
-            self._ensure_chat_service_set()
-            # 此处直接调用底层的验证方法，不通过key_pool
-            is_valid = await self.valid_key_pool._verify_key(key)
-            if not is_valid:
-                await self.error_processor.process_error(key, Exception("Manual validation failed"))
-            return is_valid
-        except Exception as e:
-            await self.error_processor.process_error(key, e)
-            return False
 
 _singleton_instance = None
 _singleton_lock = asyncio.Lock()

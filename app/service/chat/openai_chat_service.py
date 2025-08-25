@@ -18,6 +18,7 @@ from app.domain.openai_models import ChatRequest, ImageGenerationRequest
 from app.handler.message_converter import OpenAIMessageConverter
 from app.handler.response_handler import OpenAIResponseHandler
 from app.handler.stream_optimizer import openai_optimizer
+from app.handler.error_processor import handle_api_error_and_get_next_key
 from app.log.logger import get_openai_logger
 from app.service.client.api_client import GeminiApiClient
 from app.service.image.image_create_service import ImageCreateService
@@ -354,25 +355,15 @@ class OpenAIChatService:
             match = re.search(r"status code (\d+)", error_log_msg)
             status_code = int(match.group(1)) if match else 500
 
-            if self.key_manager:
-                await self.key_manager.error_processor.process_error(
-                    key=api_key,
-                    exception=e,
-                    model_name=model,
-                    request_msg=payload,
-                    status_code_override=status_code
-                )
-            else:
-                # Fallback for consistency, though key_manager should ideally be present
-                await add_error_log(
-                    gemini_key=api_key,
-                    model_name=model,
-                    error_type="openai-chat-non-stream",
-                    error_log=error_log_msg,
-                    error_code=status_code,
-                    request_msg=payload,
-                    request_datetime=request_datetime,
-                )
+            await add_error_log(
+                gemini_key=api_key,
+                model_name=model,
+                error_type="openai-chat-non-stream",
+                error_log=error_log_msg,
+                error_code=status_code,
+                request_msg=payload,
+                request_datetime=request_datetime,
+            )
             raise e
         finally:
             end_time = time.perf_counter()
@@ -562,15 +553,19 @@ class OpenAIChatService:
                     else:
                         status_code = 500
 
+                await add_error_log(
+                    gemini_key=current_attempt_key,
+                    model_name=model,
+                    error_type="openai-chat-stream",
+                    error_log=error_log_msg,
+                    error_code=status_code,
+                    request_msg=payload,
+                )
+
                 if self.key_manager:
-                    await self.key_manager.error_processor.process_error(
-                        key=current_attempt_key,
-                        exception=e,
-                        model_name=model,
-                        request_msg=payload,
-                        status_code_override=status_code
+                    new_api_key = await handle_api_error_and_get_next_key(
+                        self.key_manager, e, current_attempt_key, model, retries
                     )
-                    new_api_key = await self.key_manager.get_next_working_key(model)
                     if new_api_key and new_api_key != current_attempt_key:
                         final_api_key = new_api_key
                         logger.info(

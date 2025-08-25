@@ -138,19 +138,79 @@ class StatsService:
                 "calls_month": default_stat.copy(),
             }
 
-    async def get_api_call_details(self, period: str) -> list[dict]:
+    async def get_api_call_details(self, period: str, page: int = 1, limit: int = 100) -> list[dict]:
         """
-        获取指定时间段内的 API 调用详情
+        获取指定时间段内的 API 调用详情 (支持分页)
 
         Args:
-            period: 时间段标识 ('1m', '1h', '24h')
+            period: 时间段标识 ('1m', '1h', '8h', '24h')
+            page: 页码 (从1开始)
+            limit: 每页数量
 
         Returns:
-            包含调用详情的字典列表，每个字典包含 timestamp, key, model, status, status_code, latency_ms, error_log_id(可选)
+            包含调用详情的字典列表
 
         Raises:
             ValueError: 如果 period 无效
         """
+        now = datetime.datetime.now()
+        if period == "1m":
+            start_time = now - datetime.timedelta(minutes=1)
+        elif period == "1h":
+            start_time = now - datetime.timedelta(hours=1)
+        elif period == "8h":
+            start_time = now - datetime.timedelta(hours=8)
+        elif period == "24h":
+            start_time = now - datetime.timedelta(hours=24)
+        else:
+            raise ValueError(f"无效的时间段标识: {period}")
+
+        offset = (page - 1) * limit
+
+        try:
+            query = (
+                select(
+                    RequestLog.request_time.label("timestamp"),
+                    RequestLog.api_key.label("key"),
+                    RequestLog.model_name.label("model"),
+                    RequestLog.status_code.label("status_code"),
+                    RequestLog.latency_ms.label("latency_ms"),
+                )
+                .where(RequestLog.request_time >= start_time)
+                .order_by(RequestLog.request_time.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+
+            results = await database.fetch_all(query)
+
+            details: list[dict] = []
+            for row in results:
+                status = "failure"
+                if row["status_code"] is not None:
+                    status = "success" if 200 <= row["status_code"] < 300 else "failure"
+
+                record = {
+                    "timestamp": row["timestamp"].isoformat(),
+                    "key": row["key"],
+                    "model": row["model"],
+                    "status": status,
+                    "status_code": row["status_code"],
+                    "latency_ms": row["latency_ms"],
+                }
+                details.append(record)
+
+            logger.info(
+                f"Retrieved {len(details)} API call details for period '{period}', page {page}"
+            )
+            return details
+
+        except Exception as e:
+            logger.error(f"Failed to get API call details for period '{period}', page {page}: {e}")
+            raise
+
+    async def get_all_api_call_details(self, period: str) -> list[dict]:
+        """获取指定时间段内的所有API调用详情 (无分页)"""
         now = datetime.datetime.now()
         if period == "1m":
             start_time = now - datetime.timedelta(minutes=1)
@@ -192,16 +252,15 @@ class StatsService:
                     "status_code": row["status_code"],
                     "latency_ms": row["latency_ms"],
                 }
-
                 details.append(record)
 
             logger.info(
-                f"Retrieved {len(details)} API call details for period '{period}'"
+                f"Retrieved all {len(details)} API call details for period '{period}'"
             )
             return details
 
         except Exception as e:
-            logger.error(f"Failed to get API call details for period '{period}': {e}")
+            logger.error(f"Failed to get all API call details for period '{period}': {e}")
             raise
 
     async def get_key_call_details(self, key: str, period: str) -> list[dict]:
@@ -233,6 +292,8 @@ class StatsService:
 
             results = await database.fetch_all(query)
 
+            from app.database.models import ErrorLog
+
             details: list[dict] = []
             for row in results:
                 status = "failure"
@@ -248,6 +309,29 @@ class StatsService:
                     "latency_ms": row["latency_ms"],
                 }
 
+                if status == "failure" and row["key"]:
+                    try:
+                        ts = row["timestamp"]
+                        start_win = ts - datetime.timedelta(minutes=5)
+                        end_win = ts + datetime.timedelta(minutes=5)
+                        err_query = (
+                            select(ErrorLog.id)
+                            .where(
+                                ErrorLog.gemini_key == row["key"],
+                                ErrorLog.request_time >= start_win,
+                                ErrorLog.request_time < end_win,
+                            )
+                            .order_by(ErrorLog.request_time.desc())
+                            .limit(1)
+                        )
+                        err = await database.fetch_one(err_query)
+                        if err:
+                            record["error_log_id"] = err["id"]
+                    except Exception as _e:
+                        logger.debug(
+                            f"No matching error log found for key ending ...{row['key'][-4:] if row['key'] else ''}: {_e}"
+                        )
+
                 details.append(record)
 
             logger.info(
@@ -260,7 +344,9 @@ class StatsService:
             )
             raise
 
-    async def get_attention_keys_last_24h(self, include_keys: set[str], limit: int = 20, status_code: int = 429) -> list[dict]:
+    async def get_attention_keys_last_24h(
+        self, include_keys: set[str], limit: int = 20, status_code: int = 429
+    ) -> list[dict]:
         """返回最近24小时内指定状态码(默认429)最多的Key列表，仅包含include_keys中的Key。
 
         Returns: [{"key": str, "count": int, "status_code": int}, ...] 按次数降序
@@ -292,7 +378,9 @@ class StatsService:
                 if row["key"]
             ]
         except Exception as e:
-            logger.error(f"Failed to get attention keys ({status_code}) in last 24h: {e}")
+            logger.error(
+                f"Failed to get attention keys ({status_code}) in last 24h: {e}"
+            )
             return []
 
     async def get_key_usage_details_last_24h(self, key: str) -> Union[dict, None]:

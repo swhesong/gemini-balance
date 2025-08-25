@@ -52,11 +52,11 @@ def _handle_openai_stream_response(
         )
 
         if not text and not tool_calls and not reasoning_content:
-            return None
-        
-        delta = {"content": text, "reasoning_content": reasoning_content, "role": "assistant"}
-        if tool_calls:
-            delta["tool_calls"] = tool_calls
+            delta = {}
+        else:
+            delta = {"content": text, "reasoning_content": reasoning_content, "role": "assistant"}
+            if tool_calls:
+                delta["tool_calls"] = tool_calls
         
         choice = {
             "index": index,
@@ -196,7 +196,7 @@ def _extract_result(
                 if "thought" in parts[0]:
                     if not gemini_format and settings.SHOW_THINKING_PROCESS:
                         reasoning_content = text
-                        # text = ""  # Do not clear text, so that the client can receive and display the thinking process
+                        text = ""
                     thought = parts[0].get("thought")
             elif "executableCode" in parts[0]:
                 text = _format_code_block(parts[0]["executableCode"])
@@ -325,9 +325,6 @@ def _handle_gemini_stream_response(
     text, reasoning_content, tool_calls, thought = _extract_result(
         response, model, stream=stream, gemini_format=True
     )
-    if not text and not tool_calls and not reasoning_content:
-        return None
-    
     if tool_calls:
         content = {"parts": tool_calls, "role": "model"}
     else:

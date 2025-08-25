@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     MAX_FAILURES: int = 3
     TEST_MODEL: str = DEFAULT_MODEL
     TIME_OUT: int = DEFAULT_TIMEOUT
-    MAX_RETRIES: int = Field(default=MAX_RETRIES)
+    MAX_RETRIES: int = MAX_RETRIES
     PROXIES: List[str] = []
     PROXIES_USE_CONSISTENCY_HASH_BY_API_KEY: bool = True  # 是否使用一致性哈希来选择代理
     VERTEX_API_KEYS: List[str] = []
@@ -123,6 +123,7 @@ class Settings(BaseSettings):
     POOL_MIN_THRESHOLD: int = 10  # 池大小最小阈值，低于此值时主动补充
     EMERGENCY_REFILL_COUNT: int = 5  # 紧急补充时并发验证的密钥数量
     POOL_MAINTENANCE_INTERVAL_MINUTES: int = 30  # 密钥池维护间隔（分钟）
+    KEY_VALIDATION_GRACE_PERIOD_MINUTES: int = 10 # 密钥验证宽限期（分钟）
 
     # 密钥池使用策略配置
     PRO_MODELS: List[str] = [
