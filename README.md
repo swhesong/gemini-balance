@@ -180,12 +180,12 @@ app/
   <table>
     <tr>
       <td align="center">
-        <img src="https://raw.githubusercontent.com/sofs2005/difytask/refs/heads/main/img/wx.png" alt="微信赞赏码" width="200"/>
+        <img src="wx.png" alt="微信赞赏码" width="200"/>
         <br/>
         <strong>微信赞赏</strong>
       </td>
       <td align="center">
-        <img src="https://raw.githubusercontent.com/sofs2005/difytask/refs/heads/main/img/zfb.jpg" alt="支付宝收款码" width="200"/>
+        <img src="zfb.jpg" alt="支付宝收款码" width="200"/>
         <br/>
         <strong>支付宝</strong>
       </td>
