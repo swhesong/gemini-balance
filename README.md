@@ -24,7 +24,7 @@
 
 这是基于 [snailyp](https://github.com/snailyp) 优秀的 **Gemini Balance** 项目的个人分支版本。原项目提供了全面的 Gemini API 代理和负载均衡功能。
 
-**原项目地址**: [https://github.com/snailyp/gemini-balance](https://github.com/snailyp/gemini-balance)
+**原项目地址**: [https://github.com/sofs2005/gemini-balance](https://github.com/sofs2005/gemini-balance)
 
 <details>
 <summary>📂 查看项目结构</summary>
